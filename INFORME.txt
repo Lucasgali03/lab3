@@ -1,0 +1,548 @@
+/*
+ * INFORME — Laboratorio 3
+ * Análisis Capa de Transporte y Sockets
+ * Universidad de los Andes — Infraestructura de Comunicaciones
+ * ============================================================
+ * Este archivo sirve como base para el informe en PDF.
+ * Contiene las respuestas a todas las preguntas de análisis.
+ */
+
+==========================================================================
+  LABORATORIO #3: ANÁLISIS CAPA DE TRANSPORTE Y SOCKETS
+  Sistema de Noticias Deportivas en Tiempo Real
+==========================================================================
+
+────────────────────────────────────────────────────────────────────────
+1. DESCRIPCIÓN DEL SISTEMA IMPLEMENTADO
+────────────────────────────────────────────────────────────────────────
+
+Se implementó un sistema publicación–suscripción (pub-sub) en lenguaje C
+puro, con dos versiones: una usando TCP y otra usando UDP.
+
+Componentes:
+  • broker_tcp.c  / broker_udp.c    — Nodo central de distribución
+  • publisher_tcp.c / publisher_udp.c — Periodista deportivo (fuente)
+  • subscriber_tcp.c / subscriber_udp.c — Aficionado (receptor)
+
+Protocolo de mensajes (texto plano delimitado por '\n'):
+  PUB\n                → Registro de publicador (TCP)
+  SUB|tema1,tema2\n    → Registro de suscriptor con temas de interés
+  MSG|tema|contenido\n → Evento enviado por publicador al broker
+  [tema] contenido\n   → Evento reenviado a suscriptores
+  ACK\n                → Confirmación de registro (UDP, manual)
+
+Puertos utilizados:
+  • TCP: 8080
+  • UDP: 9090
+
+────────────────────────────────────────────────────────────────────────
+2. FUNCIONES DE SOCKET UTILIZADAS Y SU JUSTIFICACIÓN
+────────────────────────────────────────────────────────────────────────
+
+socket(AF_INET, SOCK_STREAM, 0)   — TCP
+  Crea un socket de tipo "stream" (flujo). AF_INET indica IPv4.
+  SOCK_STREAM garantiza un canal de bytes ordenado y confiable.
+
+socket(AF_INET, SOCK_DGRAM, 0)    — UDP
+  Crea un socket de tipo "datagrama". SOCK_DGRAM indica que cada
+  llamada send/recv es un paquete independiente, sin conexión.
+
+bind(fd, addr, len)
+  Asocia el socket a una dirección IP y puerto. Necesario en el
+  servidor para que los clientes sepan a dónde conectarse. En UDP
+  también es necesario en el suscriptor para recibir datagramas.
+
+listen(fd, backlog)               — Solo TCP
+  Pone el socket servidor en modo escucha. El parámetro backlog (10)
+  indica cuántas conexiones pendientes puede encolar el sistema
+  operativo antes de que el programa las acepte con accept().
+
+accept(fd, addr, len)             — Solo TCP
+  Bloquea hasta que llega una conexión. Al retornar, devuelve un
+  nuevo socket (file descriptor) exclusivo para ese cliente.
+  Internamente, TCP completó el handshake de 3 vías.
+
+connect(fd, addr, len)            — Solo TCP
+  Inicia el handshake de 3 vías desde el cliente:
+    Cliente → SYN     → Servidor
+    Cliente ← SYN-ACK ← Servidor
+    Cliente → ACK     → Servidor
+  Después de connect(), el canal TCP está establecido.
+
+send(fd, buf, len, flags)         — TCP
+  Envía datos por el canal TCP. Si el buffer del receptor está
+  lleno, send() bloquea (control de flujo). TCP fragmenta el
+  mensaje si es muy grande y lo reensambla en el receptor.
+
+recv(fd, buf, len, flags)         — TCP
+  Recibe datos del canal TCP. Bloquea hasta que haya datos.
+  IMPORTANTE: recv() puede retornar menos bytes de los pedidos
+  (partial read) porque TCP es un protocolo de flujo de bytes,
+  no de mensajes. Esto diferencia TCP de UDP.
+
+sendto(fd, buf, len, 0, addr, len) — UDP
+  Envía un datagrama a la dirección especificada. No hay conexión
+  previa. Si el destino no existe, el error llega asíncronamente
+  (si llega); sendto() retorna inmediatamente sin garantías.
+
+recvfrom(fd, buf, len, 0, addr, len) — UDP
+  Recibe un datagrama completo. A diferencia de recv() en TCP,
+  recvfrom() devuelve SIEMPRE un mensaje completo (boundary preserving).
+  También devuelve la dirección del remitente (esencial para UDP).
+
+setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))
+  Permite reutilizar el puerto inmediatamente después de reiniciar
+  el broker, evitando el error "Address already in use".
+
+pthread_create() / pthread_mutex_lock()  — Solo broker_tcp.c
+  Cada cliente TCP requiere un hilo propio porque recv() bloquea.
+  El mutex protege el arreglo de suscriptores ante condiciones de
+  carrera cuando múltiples hilos acceden simultáneamente.
+
+select(fd+1, &rfds, NULL, NULL, &timeout)  — subscriber_udp.c
+  Permite esperar datos con un tiempo límite. Se usa para detectar
+  si el ACK del broker se perdió (demostración de no-confiabilidad UDP).
+
+────────────────────────────────────────────────────────────────────────
+3. TABLA COMPARATIVA TCP vs UDP
+────────────────────────────────────────────────────────────────────────
+
+┌───────────────────────┬──────────────────────────────┬──────────────────────────────┐
+│ Criterio              │ TCP                          │ UDP                          │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Confiabilidad         │ Alta. Retransmisión automá-  │ Ninguna. Los datagramas      │
+│                       │ tica si hay pérdida (ACK).   │ perdidos no se recuperan.    │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Orden de entrega      │ Garantizado. TCP reensambla  │ No garantizado. Paquetes     │
+│                       │ los segmentos en orden.      │ pueden llegar desordenados.  │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Pérdida de mensajes   │ Imposible (en condiciones    │ Posible. Si un paquete no    │
+│                       │ normales). TCP retransmite.  │ llega, se pierde para siempre│
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Overhead de cabecera  │ 20 bytes mínimo (puede ser   │ 8 bytes fijos.               │
+│                       │ más con opciones TCP).       │ Mucho menor overhead.        │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Establecimiento       │ Handshake de 3 vías antes    │ Sin conexión. Primer paquete │
+│ de conexión           │ de enviar datos.             │ ya es datos.                 │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Control de flujo      │ Sí. Ventana deslizante.      │ No. El emisor puede          │
+│                       │ Evita saturar al receptor.   │ saturar al receptor.         │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Control de congestión │ Sí. Slow Start, AIMD.        │ No. La app debe              │
+│                       │ Adapta la tasa de envío.     │ implementarlo si lo necesita.│
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Latencia              │ Mayor (por handshake, ACKs,  │ Menor. Sin negociación       │
+│                       │ control de flujo).           │ previa ni confirmaciones.    │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Complejidad broker    │ Alta. Un hilo por cliente,   │ Baja. Un hilo único,         │
+│                       │ estado por conexión, mutex.  │ sin estado de conexión.      │
+├───────────────────────┼──────────────────────────────┼──────────────────────────────┤
+│ Escalabilidad         │ Limitada por el nro. de      │ Alta. No hay conexiones       │
+│                       │ conexiones simultáneas.      │ persistentes que gestionar.  │
+└───────────────────────┴──────────────────────────────┴──────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────
+4. RESPUESTAS A LAS PREGUNTAS DE ANÁLISIS
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 1:
+¿Qué ocurriría si en lugar de dos publicadores hubiera cien partidos
+simultáneos? ¿Cómo impactaría en el desempeño del broker bajo TCP y UDP?
+
+RESPUESTA:
+
+Bajo TCP:
+  Cada publicador y cada suscriptor mantiene una conexión TCP activa.
+  Con 100 publicadores y, por ejemplo, 500 suscriptores, el broker
+  gestionaría 600 sockets abiertos simultáneamente. Cada conexión TCP
+  requiere memoria en el kernel (buffers de envío y recepción, por
+  defecto ~87 KB por socket en Linux). Adicionalmente, en nuestra
+  implementación con pthreads, se crearía un hilo por cada cliente,
+  lo que implica ~600 hilos con sus stacks (típicamente 8 MB cada uno).
+  El resultado: alto consumo de memoria y CPU por cambios de contexto.
+  Una mejora real usaría select()/epoll() para multiplexar todos los
+  sockets en un número reducido de hilos (I/O multiplexing).
+
+Bajo UDP:
+  No hay conexiones persistentes. El broker solo mantiene en memoria
+  la lista de suscriptores registrados (IP + puerto). Con 100 partidos
+  y 500 suscriptores, la tabla tiene 500 entradas. Cada datagrama
+  entrante se procesa en el mismo hilo (bucle recvfrom). El impacto en
+  memoria y CPU es mucho menor. Sin embargo, si 100 publicadores envían
+  simultáneamente a alta frecuencia, el buffer de recepción UDP del
+  broker podría saturarse y el kernel descartaría datagramas (pérdida
+  silenciosa sin notificar al emisor).
+
+CONCLUSIÓN: UDP escala mejor con muchos partidos simultáneos, pero
+  a costa de poder perder mensajes. TCP garantiza entrega pero consume
+  más recursos por conexión.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 2:
+Si un gol se envía como mensaje y un suscriptor no lo recibe en UDP,
+¿qué implicaciones tendría? ¿Por qué TCP maneja mejor este escenario?
+
+RESPUESTA:
+
+En UDP, la pérdida de un datagrama es silenciosa: ni el publicador
+ni el broker se enteran. El suscriptor que no recibió el gol verá
+el marcador incorrecto: si el partido estaba 0-0 y se pierde el
+datagrama del gol al minuto 12, el suscriptor seguirá viendo 0-0.
+Cuando llegue el siguiente gol (al minuto 34), verá directamente 2-0,
+pero pensará que es 1-0. La información es inconsistente y puede
+confundir al aficionado creyendo que el partido sigue igualado.
+
+En TCP, esto es imposible en condiciones normales: TCP detecta la
+pérdida mediante el temporizador de retransmisión y el mecanismo de
+ACK. Si el receptor no confirma la recepción, TCP retransmite el
+segmento automáticamente, hasta 15 veces por defecto en Linux. El
+suscriptor siempre recibirá el gol, aunque con un pequeño retardo
+en redes congestionadas.
+
+Para un sistema de noticias deportivas, perder un gol es crítico
+porque impacta directamente la experiencia del usuario y la
+integridad de la información mostrada. TCP es la elección correcta
+para eventos de alta importancia.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 3:
+¿Qué protocolo (TCP o UDP) resultaría más adecuado para seguimiento
+en vivo de partidos?
+
+RESPUESTA:
+
+Para un sistema de actualizaciones de partidos (goles, tarjetas,
+marcador), TCP es más adecuado por las siguientes razones:
+
+1. Integridad de datos: cada evento (gol, cambio, tarjeta) es un
+   hecho que el aficionado DEBE recibir. La pérdida de información
+   nunca es aceptable en este contexto.
+
+2. Orden correcto: el marcador tiene sentido cronológico. Ver "2-1"
+   antes que "1-1" es peor que no verlo. TCP garantiza el orden.
+
+3. Frecuencia moderada: las actualizaciones deportivas ocurren cada
+   varios minutos (no miles por segundo), por lo que el overhead del
+   handshake TCP es despreciable frente al beneficio de confiabilidad.
+
+UDP sería preferible si:
+- Se transmitieran estadísticas en tiempo real con alta frecuencia
+  (posición del balón 30 veces/segundo) donde perder un frame es
+  aceptable porque llega el siguiente inmediatamente.
+- La latencia fuera crítica (videojuegos en tiempo real).
+
+CONCLUSIÓN PRÁCTICA: Las apps reales como ESPN o DAZN usan WebSockets
+(que corren sobre TCP) para actualizaciones de marcador. UDP se usa
+para los streams de video/audio donde algo de pérdida es tolerable.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 4:
+Compare el overhead observado en capturas Wireshark entre TCP y UDP.
+¿Cuál introduce más cabeceras por mensaje?
+
+RESPUESTA:
+
+Cabecera UDP: 8 bytes fijos
+  - Puerto origen (2 bytes)
+  - Puerto destino (2 bytes)
+  - Longitud (2 bytes)
+  - Checksum (2 bytes)
+
+Cabecera TCP: 20 bytes mínimo (puede llegar a 60 con opciones)
+  - Puerto origen (2 bytes)
+  - Puerto destino (2 bytes)
+  - Número de secuencia (4 bytes) — fundamental para orden y ACK
+  - Número de ACK (4 bytes)
+  - Longitud cabecera + flags (2 bytes)
+  - Ventana (2 bytes) — control de flujo
+  - Checksum (2 bytes)
+  - Puntero urgente (2 bytes)
+  + Opciones: timestamps, SACK, MSS (aumentan la cabecera)
+
+Para un mensaje de texto como "MSG|Colombia vs Brasil|Gol al minuto 12"
+(~45 bytes de datos):
+  - UDP: overhead = 8/53 = 15%
+  - TCP: overhead = 20/65 = 31% (solo cabecera TCP, sin IP)
+
+Además, TCP genera tráfico adicional:
+  - 3 paquetes extra en el handshake de apertura
+  - ACKs de confirmación por cada segmento
+  - 4 paquetes extra en el cierre de conexión (FIN-ACK)
+
+En Wireshark, para una sesión TCP con 12 mensajes veremos
+aproximadamente 12 + 3 (handshake) + 12 (ACKs) + 4 (cierre) = 31+
+paquetes. En UDP, solo 12 datagramas de publicador a broker, más
+12 de broker a cada suscriptor.
+
+TCP introduce significativamente más cabeceras y paquetes, pero
+esto es el costo de la confiabilidad.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 5:
+Si el marcador llega desordenado en UDP (primero 2-1, luego 1-1),
+¿qué efectos tendría? ¿Cómo solucionarlo a nivel de aplicación?
+
+RESPUESTA:
+
+Efectos:
+  El aficionado vería primero el marcador 2-1 y luego 1-1, lo que
+  es incoherente y genera confusión. Podría pensar que hubo un error
+  técnico, que el árbitro anuló un gol, o que la aplicación está
+  fallando. La confianza en el sistema se pierde.
+
+Soluciones a nivel de aplicación (sobre UDP):
+  1. Número de secuencia en cada mensaje (implementado en nuestro
+     publisher_udp.c con [SEQ:XX]). El suscriptor descarta o reordena
+     mensajes con SEQ menor al último recibido.
+  
+  2. Buffer de reordenamiento: al recibir un datagrama, el suscriptor
+     lo guarda en un buffer ordenado por SEQ y solo procesa el
+     siguiente esperado. Introduce latencia artificial pero garantiza
+     orden.
+  
+  3. Timestamp en cada mensaje: si el origen garantiza timestamps
+     monótonos, el receptor puede ordenar por timestamp.
+  
+  4. Protocolo de control propio (QUIC): implementar sobre UDP un
+     mini-protocolo que gestione orden, ACKs y retransmisión. Esto
+     es básicamente lo que hace QUIC (usado en HTTP/3).
+
+La solución más práctica para este laboratorio es la opción 1
+(número de secuencia), que permite al suscriptor detectar y reportar
+mensajes fuera de orden (implementado en subscriber_udp.c).
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 6:
+¿Cómo cambia el desempeño cuando aumenta el número de suscriptores?
+¿Qué diferencias hay entre TCP y UDP?
+
+RESPUESTA:
+
+TCP:
+  - Cada nuevo suscriptor = una nueva conexión TCP = un nuevo hilo
+    en nuestra implementación = ~8 MB de stack + overhead del kernel.
+  - El broker debe llamar a send() por cada suscriptor para cada
+    mensaje, lo cual escala linealmente O(n) con n suscriptores.
+  - Con miles de suscriptores, la solución de hilos (1 hilo/cliente)
+    colapsa. Se necesitaría epoll() + pool de hilos.
+
+UDP:
+  - Cada nuevo suscriptor = una entrada más en el arreglo de
+    suscriptores registrados. No hay sockets adicionales en el broker.
+  - sendto() por cada suscriptor también es O(n), pero sin overhead
+    de gestión de conexión.
+  - El broker UDP puede gestionar miles de suscriptores con un único
+    hilo, limitado solo por el ancho de banda de salida.
+
+OBSERVACIÓN EN EL LABORATORIO:
+  Con 2 suscriptores, ambas versiones funcionan fluidamente. Si se
+  prueban con 10+ suscriptores, el broker UDP seguirá respondiendo
+  normalmente mientras el broker TCP podría mostrar latencia por el
+  mayor número de hilos activos.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 7:
+¿Qué sucede si el broker se detiene inesperadamente?
+¿Qué diferencias hay entre TCP y UDP en recuperación?
+
+RESPUESTA:
+
+TCP:
+  - Cuando el broker cierra su socket (o el proceso muere), el kernel
+    envía un RST o FIN a todos los clientes conectados.
+  - Los publicadores recibirán un error en send() (broken pipe / EPIPE).
+  - Los suscriptores recibirán 0 bytes en recv() (EOF), indicando
+    cierre de conexión.
+  - La detección de la caída es inmediata (en el siguiente intento
+    de lectura/escritura). El sistema puede implementar reconexión
+    automática.
+
+UDP:
+  - El broker simplemente deja de procesar datagramas.
+  - Los publicadores continúan enviando sendto() sin error alguno
+    (UDP no verifica si el destino existe). Los mensajes se pierden
+    silenciosamente.
+  - Los suscriptores simplemente dejan de recibir mensajes; no hay
+    forma de distinguir entre "no hay eventos" y "broker caído".
+  - Para detectar la caída en UDP, se necesita un mecanismo de
+    heartbeat: el broker envía periódicamente un paquete "alive" y
+    el suscriptor detecta ausencia de heartbeats.
+
+CONCLUSIÓN: TCP detecta fallos de forma inmediata y confiable.
+  UDP requiere lógica adicional (heartbeat, timeouts) para detectar
+  que el broker está caído.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 8:
+¿Cómo garantizar que todos los suscriptores reciban simultáneamente
+las actualizaciones críticas? ¿Qué protocolo facilita mejor esto?
+
+RESPUESTA:
+
+Ni TCP ni UDP garantizan sincronización perfecta a múltiples
+receptores. El broker envía secuencialmente (send() uno por uno),
+por lo que el primer suscriptor recibe el mensaje microsegundos
+antes que el último.
+
+Para minimizar la diferencia de tiempo:
+  - TCP: usar non-blocking sockets + epoll para enviar a todos los
+    suscriptores casi simultáneamente, sin esperar ACK de uno antes
+    de enviar al siguiente.
+  - UDP: multicast (envío a una dirección de grupo que todos los
+    suscriptores escuchan). Con IP multicast, el router replica el
+    paquete y llega exactamente al mismo tiempo a todos los receptores
+    en la misma red. Esto es imposible con TCP (que es unicast).
+
+Para sincronización precisa global (suscriptores en distintas redes),
+se usaría NTP para que todos tengan el mismo reloj, y el broker
+incluiría un timestamp en cada mensaje. Los suscriptores mostrarían
+el mensaje en el instante indicado por el timestamp.
+
+PROTOCOLO MÁS ADECUADO PARA SINCRONIZACIÓN: UDP con multicast, aunque
+  requiere soporte de la infraestructura de red.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 9:
+¿Uso de CPU y memoria en el broker con múltiples conexiones TCP
+vs. datagramas UDP?
+
+RESPUESTA:
+
+TCP (broker_tcp.c con pthreads):
+  Memoria por conexión:
+    - Socket buffer de envío: ~87 KB (configurable con SO_SNDBUF)
+    - Socket buffer de recepción: ~87 KB (configurable con SO_RCVBUF)
+    - Stack del hilo: ~8 MB por defecto en Linux
+    - Estructura del hilo en kernel: ~4 KB
+  Con 10 clientes: ~10 * (8 MB + 174 KB) ≈ 82 MB solo en stacks
+  Con 100 clientes: ~800 MB (impractical sin ajuste de stack size)
+
+  CPU por conexión:
+    - Cada cambio de contexto entre hilos: ~1-10 microsegundos
+    - Con muchos hilos compitiendo, la CPU pierde tiempo en scheduling.
+
+UDP (broker_udp.c con un solo hilo):
+  Memoria:
+    - Un socket + sus buffers: ~174 KB
+    - Arreglo de suscriptores: ~100 entradas * ~200 bytes = 20 KB
+    - TOTAL: ~194 KB independientemente de cuántos suscriptores haya.
+  
+  CPU:
+    - Un solo hilo sin cambios de contexto por clientes.
+    - Procesamiento secuencial: más predecible y eficiente.
+
+OBSERVACIÓN: El broker UDP usa ~400x menos memoria con 100 suscriptores
+  comparado con el broker TCP usando 1 hilo/cliente. En producción, el
+  broker TCP necesitaría usar epoll() + pool de hilos fijo para ser
+  competitivo.
+
+────────────────────────────────────────────────────────────────────────
+
+PREGUNTA 10:
+¿Elegiría TCP, UDP o una combinación para un sistema real de millones
+de usuarios?
+
+RESPUESTA:
+
+Para un sistema real de actualizaciones de partidos para millones de
+usuarios, la respuesta óptima es UNA COMBINACIÓN:
+
+ARQUITECTURA RECOMENDADA:
+
+  Nivel 1 — Recolección de eventos (Periodista → Broker):
+    Protocolo: TCP
+    Razón: Los periodistas envían pocos mensajes pero críticos.
+    La confiabilidad es prioritaria. Perder un gol en el origen
+    es inaceptable.
+
+  Nivel 2 — Distribución masiva (Broker → CDN/Servidores Edge):
+    Protocolo: TCP con conexiones persistentes (WebSocket o HTTP/2)
+    hacia servidores edge distribuidos geográficamente. Cada
+    servidor edge gestiona su región.
+
+  Nivel 3 — Entrega al usuario final (Edge → Millones de usuarios):
+    Protocolo: WebSocket sobre TCP para la mayoría de los usuarios.
+    WebSocket permite comunicación bidireccional sobre TCP estándar,
+    compatible con firewalls y NATs.
+    Alternativamente, HTTP/3 (QUIC sobre UDP) para reducir latencia
+    en redes móviles, con las garantías de entrega implementadas
+    en la capa QUIC.
+
+JUSTIFICACIÓN BASADA EN EL LABORATORIO:
+  - TCP garantizó que todos los mensajes llegaran completos y en orden
+    en nuestras pruebas. Ningún gol se perdió.
+  - UDP mostró menor overhead por mensaje, pero la complejidad de
+    implementar confiabilidad manualmente (ACKs, reordenamiento) en
+    el laboratorio fue considerable.
+  - La combinación aprovecha lo mejor de ambos mundos: confiabilidad
+    de TCP donde importa, eficiencia de UDP/QUIC donde la escala
+    lo requiere.
+
+EJEMPLO REAL: Twitter/X usa WebSockets (TCP) para sus actualizaciones
+  en tiempo real. YouTube Live usa QUIC (UDP con confiabilidad
+  integrada) para streaming de video.
+
+────────────────────────────────────────────────────────────────────────
+5. OBSERVACIONES DE WIRESHARK
+────────────────────────────────────────────────────────────────────────
+
+Filtros para usar en Wireshark:
+
+  TCP:
+    tcp.port == 8080                    → Todo el tráfico del lab
+    tcp.flags.syn == 1                  → Ver handshakes
+    tcp.flags.fin == 1                  → Ver cierres de conexión
+    tcp.len > 0 && tcp.port == 8080     → Solo segmentos con datos
+
+  UDP:
+    udp.port == 9090                    → Todo el tráfico UDP
+    frame contains "MSG"                → Solo mensajes de eventos
+
+Qué observar en TCP (archivo tcp_pubsub.pcap):
+  1. Paquetes SYN / SYN-ACK / ACK al inicio de cada conexión
+     (handshake de 3 vías).
+  2. Segmentos con datos PSH+ACK: cada send() genera uno.
+  3. ACKs del receptor confirmando recepción.
+  4. Paquetes FIN / FIN-ACK / ACK al cerrar la conexión.
+  5. Números de secuencia crecientes que garantizan el orden.
+
+Qué observar en UDP (archivo udp_pubsub.pcap):
+  1. Datagramas individuales, sin establecimiento de conexión.
+  2. Ausencia de ACKs (solo datos en una dirección).
+  3. Cabecera de solo 8 bytes vs 20+ bytes TCP.
+  4. En caso de pérdida simulada (desconectar temporalmente):
+     el datagrama simplemente desaparece del pcap.
+  5. Si se envían muy rápido, posible desorden de números de paquete.
+
+────────────────────────────────────────────────────────────────────────
+6. INSTRUCCIONES DE EJECUCIÓN
+────────────────────────────────────────────────────────────────────────
+
+Compilar:
+  make
+
+Prueba TCP (5 terminales):
+  Terminal 1: ./broker_tcp
+  Terminal 2: ./subscriber_tcp 127.0.0.1 "Colombia vs Brasil"
+  Terminal 3: ./subscriber_tcp 127.0.0.1 "Colombia vs Brasil" "Argentina vs Peru"
+  Terminal 4: ./publisher_tcp 127.0.0.1 "Colombia vs Brasil"
+  Terminal 5: ./publisher_tcp 127.0.0.1 "Argentina vs Peru"
+
+Prueba UDP (5 terminales — suscriptores ANTES de publicadores):
+  Terminal 1: ./broker_udp
+  Terminal 2: ./subscriber_udp 127.0.0.1 "Colombia vs Brasil"
+  Terminal 3: ./subscriber_udp 127.0.0.1 "Colombia vs Brasil" "Argentina vs Peru"
+  Terminal 4: ./publisher_udp 127.0.0.1 "Colombia vs Brasil"
+  Terminal 5: ./publisher_udp 127.0.0.1 "Argentina vs Peru"
+
+Captura Wireshark:
+  TCP: sudo wireshark -i lo -f "tcp port 8080" -w tcp_pubsub.pcap
+  UDP: sudo wireshark -i lo -f "udp port 9090" -w udp_pubsub.pcap
