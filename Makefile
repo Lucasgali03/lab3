@@ -12,48 +12,38 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -g -std=c11
 LDFLAGS = -lpthread   # pthread solo necesario para broker_tcp
 
-# Destinos principales
-TCP_TARGETS = broker_tcp publisher_tcp subscriber_tcp
-UDP_TARGETS = broker_udp publisher_udp subscriber_udp
-ALL_TARGETS = $(TCP_TARGETS) $(UDP_TARGETS)
+# Compatibilidad básica Unix/Windows
+ifeq ($(OS),Windows_NT)
+EXE_EXT = .exe
+RM_CMD  = cmd /C del /Q
+else
+EXE_EXT =
+RM_CMD  = rm -f
+endif
+
+# Programas y destinos principales
+PROGRAMS    = broker_tcp publisher_tcp subscriber_tcp broker_udp publisher_udp subscriber_udp
+TCP_TARGETS = broker_tcp$(EXE_EXT) publisher_tcp$(EXE_EXT) subscriber_tcp$(EXE_EXT)
+UDP_TARGETS = broker_udp$(EXE_EXT) publisher_udp$(EXE_EXT) subscriber_udp$(EXE_EXT)
+ALL_TARGETS = $(addsuffix $(EXE_EXT),$(PROGRAMS))
 
 .PHONY: all tcp udp clean
 
 all: $(ALL_TARGETS)
 	@echo ""
-	@echo "✅  Compilación exitosa. Ejecutables:"
-	@ls -lh $(ALL_TARGETS)
+	@echo "Compilación exitosa. Ejecutables: $(ALL_TARGETS)"
 
 tcp: $(TCP_TARGETS)
 udp: $(UDP_TARGETS)
 
-# ── Versión TCP ───────────────────────────────────────────────
-broker_tcp: broker_tcp.c
+# broker_tcp requiere pthread; el resto usa la regla patrón.
+broker_tcp$(EXE_EXT): broker_tcp.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
-	chmod +x $@
 
-publisher_tcp: publisher_tcp.c
+%$(EXE_EXT): %.c
 	$(CC) $(CFLAGS) -o $@ $<
-	chmod +x $@
-
-subscriber_tcp: subscriber_tcp.c
-	$(CC) $(CFLAGS) -o $@ $<
-	chmod +x $@
-
-# ── Versión UDP ───────────────────────────────────────────────
-broker_udp: broker_udp.c
-	$(CC) $(CFLAGS) -o $@ $<
-	chmod +x $@
-
-publisher_udp: publisher_udp.c
-	$(CC) $(CFLAGS) -o $@ $<
-	chmod +x $@
-
-subscriber_udp: subscriber_udp.c
-	$(CC) $(CFLAGS) -o $@ $<
-	chmod +x $@
 
 # ── Limpieza ──────────────────────────────────────────────────
 clean:
-	rm -f $(ALL_TARGETS)
-	@echo "🧹  Ejecutables eliminados."
+	-$(RM_CMD) $(ALL_TARGETS)
+	@echo "Ejecutables eliminados."
