@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>   /* socket(), bind(), listen(), accept() */
@@ -48,6 +50,52 @@ typedef struct {
 Subscriber      subscribers[MAX_CLIENTS];
 int             subscriber_count = 0;
 pthread_mutex_t sub_mutex = PTHREAD_MUTEX_INITIALIZER; /* Protege la lista */
+
+static ssize_t recv_line(int fd, char *buffer, size_t size) {
+    if (size == 0) return -1;
+
+    size_t total = 0;
+    while (total < size - 1) {
+        char ch;
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n == 0) {
+            if (total == 0) return 0;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+
+        buffer[total++] = ch;
+        if (ch == '\n') break;
+    }
+
+    buffer[total] = '\0';
+    return (ssize_t)total;
+}
+
+static int send_all(int fd, const char *buffer, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t sent = send(fd, buffer + total, len - total, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        total += (size_t)sent;
+    }
+    return 0;
+}
+
+static int reserve_subscriber_slot(void) {
+    for (int i = 0; i < subscriber_count; i++) {
+        if (!subscribers[i].active) return i;
+    }
+
+    if (subscriber_count >= MAX_CLIENTS) return -1;
+    return subscriber_count++;
+}
 
 /* ────────────────────────────────────────────────────────────────
  * parse_subscription()
@@ -97,8 +145,7 @@ void forward_to_subscribers(const char *topic, const char *content) {
                  * y en orden. Si el buffer del receptor está lleno, TCP
                  * bloquea al emisor (control de flujo).
                  */
-                int sent = send(subscribers[i].socket_fd, out, strlen(out), 0);
-                if (sent < 0) {
+                if (send_all(subscribers[i].socket_fd, out, strlen(out)) < 0) {
                     /* Si falló el envío, marcamos el suscriptor como inactivo */
                     subscribers[i].active = 0;
                     printf("[BROKER] Suscriptor fd=%d desconectado inesperadamente.\n",
@@ -125,17 +172,14 @@ void *handle_client(void *arg) {
     free(arg);  /* El fd fue reservado en el heap; liberamos aquí */
 
     char buffer[BUFFER_SIZE];
-    int  n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    ssize_t n = recv_line(client_fd, buffer, sizeof(buffer));
     if (n <= 0) { close(client_fd); return NULL; }
-    buffer[n] = '\0';
 
     /* ── Caso 1: Es un publicador ── */
     if (strncmp(buffer, "PUB", 3) == 0) {
         printf("[BROKER] Publicador conectado (fd=%d)\n", client_fd);
 
-        while ((n = recv(client_fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
-            buffer[n] = '\0';
-
+        while ((n = recv_line(client_fd, buffer, sizeof(buffer))) > 0) {
             /* Formato esperado: "MSG|tema|contenido\n" */
             if (strncmp(buffer, "MSG|", 4) == 0) {
                 char *p_topic   = buffer + 4;
@@ -161,7 +205,14 @@ void *handle_client(void *arg) {
     } else if (strncmp(buffer, "SUB|", 4) == 0) {
         pthread_mutex_lock(&sub_mutex);
 
-        int idx = subscriber_count++;
+        int idx = reserve_subscriber_slot();
+        if (idx < 0) {
+            pthread_mutex_unlock(&sub_mutex);
+            fprintf(stderr, "[BROKER] Limite de suscriptores alcanzado.\n");
+            close(client_fd);
+            return NULL;
+        }
+
         subscribers[idx].socket_fd  = client_fd;
         subscribers[idx].active     = 1;
         parse_subscription(buffer, &subscribers[idx]);
@@ -182,6 +233,7 @@ void *handle_client(void *arg) {
 
         pthread_mutex_lock(&sub_mutex);
         subscribers[idx].active = 0;
+        subscribers[idx].socket_fd = -1;
         pthread_mutex_unlock(&sub_mutex);
 
         printf("[BROKER] Suscriptor desconectado (fd=%d)\n", client_fd);
@@ -199,6 +251,9 @@ int main(void) {
     int server_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
+
+    /* Evita que send() mate el proceso con SIGPIPE si un peer se desconecta. */
+    signal(SIGPIPE, SIG_IGN);
 
     /* ① Crear el socket TCP
      *   AF_INET   = familia de direcciones IPv4

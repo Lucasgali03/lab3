@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -31,6 +33,43 @@
 #define TCP_PORT    8080
 #define BUFFER_SIZE 1024
 
+static ssize_t recv_line(int fd, char *buffer, size_t size) {
+    if (size == 0) return -1;
+
+    size_t total = 0;
+    while (total < size - 1) {
+        char ch;
+        ssize_t n = recv(fd, &ch, 1, 0);
+        if (n == 0) {
+            if (total == 0) return 0;
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+
+        buffer[total++] = ch;
+        if (ch == '\n') break;
+    }
+
+    buffer[total] = '\0';
+    return (ssize_t)total;
+}
+
+static int send_all(int fd, const char *buffer, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t sent = send(fd, buffer + total, len - total, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        total += (size_t)sent;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Uso: %s <ip_broker> <tema1> [tema2] ...\n", argv[0]);
@@ -39,6 +78,8 @@ int main(int argc, char *argv[]) {
     }
 
     const char *broker_ip = argv[1];
+
+    signal(SIGPIPE, SIG_IGN);
 
     /* ① Crear socket TCP */
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -72,8 +113,9 @@ int main(int argc, char *argv[]) {
     }
     strncat(reg_msg, "\n", sizeof(reg_msg) - strlen(reg_msg) - 1);
 
-    if (send(sock_fd, reg_msg, strlen(reg_msg), 0) < 0) {
+    if (send_all(sock_fd, reg_msg, strlen(reg_msg)) < 0) {
         perror("send suscripción");
+        close(sock_fd);
         return EXIT_FAILURE;
     }
 
@@ -85,22 +127,16 @@ int main(int argc, char *argv[]) {
 
     /* ⑤ Recibir mensajes indefinidamente
      *
-     *   NOTA sobre TCP y "message boundaries" (delimitación de mensajes):
-     *   TCP es un protocolo de flujo de bytes (stream), no de mensajes.
-     *   Esto significa que un recv() puede devolver datos de uno o varios
-     *   mensajes juntos (si llegaron en el mismo segmento TCP) o solo parte
-     *   de un mensaje. En este laboratorio, como los mensajes son cortos y
-     *   enviados con sleep() entre ellos, en la práctica cada recv() trae
-     *   un mensaje completo. En un sistema real, se necesitaría un parser
-     *   que maneje este caso (por ejemplo, delimitar con longitud prefijada).
+     *   Como el protocolo del laboratorio usa '\n' como delimitador,
+     *   leemos hasta completar cada línea antes de procesarla. Así no
+     *   dependemos de que recv() coincida casualmente con los límites
+     *   lógicos del mensaje.
      */
     char buffer[BUFFER_SIZE];
     int  msg_count = 0;
-    int  bytes_read;
+    ssize_t bytes_read;
 
-    while ((bytes_read = recv(sock_fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes_read] = '\0';
-
+    while ((bytes_read = recv_line(sock_fd, buffer, sizeof(buffer))) > 0) {
         /* Obtener marca de tiempo actual */
         time_t now = time(NULL);
         struct tm *t = localtime(&now);

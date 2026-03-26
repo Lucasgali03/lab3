@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -29,6 +31,19 @@
 
 #define TCP_PORT    8080
 #define BUFFER_SIZE 1024
+
+static int send_all(int fd, const char *buffer, size_t len) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t sent = send(fd, buffer + total, len - total, 0);
+        if (sent < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        total += (size_t)sent;
+    }
+    return 0;
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
@@ -39,6 +54,8 @@ int main(int argc, char *argv[]) {
 
     const char *broker_ip = argv[1];
     const char *topic     = argv[2];
+
+    signal(SIGPIPE, SIG_IGN);
 
     /* ① Crear socket TCP */
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -72,7 +89,11 @@ int main(int argc, char *argv[]) {
     printf("[PUBLISHER TCP] Conectado al broker %s:%d\n", broker_ip, TCP_PORT);
 
     /* ④ Registrarse como publicador */
-    if (send(sock_fd, "PUB\n", 4, 0) < 0) { perror("send registro"); return EXIT_FAILURE; }
+    if (send_all(sock_fd, "PUB\n", 4) < 0) {
+        perror("send registro");
+        close(sock_fd);
+        return EXIT_FAILURE;
+    }
     printf("[PUBLISHER TCP] Registrado como publicador — tema: '%s'\n", topic);
 
     /* ─── Eventos del partido ──────────────────────────────── */
@@ -109,8 +130,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        int sent = send(sock_fd, buffer, (size_t)len, 0);
-        if (sent < 0) {
+        if (send_all(sock_fd, buffer, (size_t)len) < 0) {
             perror("send mensaje");
             break;
         }
