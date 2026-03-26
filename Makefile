@@ -30,22 +30,28 @@ udp: $(UDP_TARGETS)
 # ── Versión TCP ───────────────────────────────────────────────
 broker_tcp: broker_tcp.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	chmod +x $@
 
 publisher_tcp: publisher_tcp.c
 	$(CC) $(CFLAGS) -o $@ $<
+	chmod +x $@
 
 subscriber_tcp: subscriber_tcp.c
 	$(CC) $(CFLAGS) -o $@ $<
+	chmod +x $@
 
 # ── Versión UDP ───────────────────────────────────────────────
 broker_udp: broker_udp.c
 	$(CC) $(CFLAGS) -o $@ $<
+	chmod +x $@
 
 publisher_udp: publisher_udp.c
 	$(CC) $(CFLAGS) -o $@ $<
+	chmod +x $@
 
 subscriber_udp: subscriber_udp.c
 	$(CC) $(CFLAGS) -o $@ $<
+	chmod +x $@
 
 # ── Limpieza ──────────────────────────────────────────────────
 clean:
